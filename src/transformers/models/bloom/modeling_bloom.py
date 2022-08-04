@@ -19,6 +19,7 @@ import warnings
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.distributed
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
@@ -34,7 +35,7 @@ from ...modeling_outputs import (
 from ...modeling_utils import PreTrainedModel
 from ...utils import logging
 from .configuration_bloom import BloomConfig
-
+from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding, TensorParallelRowLinear
 
 logger = logging.get_logger(__name__)
 
@@ -83,7 +84,7 @@ def _expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
     return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
 
 
-def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
+def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int) -> torch.Tensor:
     """
     Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
     relies on a translation invariance of softmax for quick implementation: with l being a tensor, and a fixed value
@@ -124,7 +125,7 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torc
     # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
     arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
     alibi = slopes[..., None] * arange_tensor
-    return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
+    return alibi
 
 
 def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: bool) -> torch.Tensor:
@@ -209,7 +210,7 @@ class BloomGelu(nn.Module):
 
 
 class BloomAttention(nn.Module):
-    def __init__(self, config: BloomConfig):
+    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
         super().__init__()
 
         self.pretraining_tp = config.pretraining_tp
@@ -231,8 +232,14 @@ class BloomAttention(nn.Module):
         self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
         self.beta = 1.0
 
-        self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
-        self.dense = nn.Linear(self.hidden_size, self.hidden_size)
+        if process_group is None:
+            self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
+            self.dense = nn.Linear(self.hidden_size, self.hidden_size)
+        else:
+            assert self.num_heads % process_group.size() == 0
+            self.num_heads = self.num_heads // process_group.size()
+            self.query_key_value = TensorParallelColumnLinear(self.hidden_size, 3 * self.hidden_size, process_group=process_group, bias=True)
+            self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -369,15 +376,19 @@ class BloomAttention(nn.Module):
 
 
 class BloomMLP(nn.Module):
-    def __init__(self, config: BloomConfig):
+    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
         super().__init__()
         hidden_size = config.hidden_size
 
         self.pretraining_tp = config.pretraining_tp
         self.slow_but_exact = config.slow_but_exact
-        self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
+        if process_group is None:
+            self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
+            self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
+        else:
+            self.dense_h_to_4h = TensorParallelColumnLinear(hidden_size, 4 * hidden_size, process_group=process_group)
+            self.dense_4h_to_h = TensorParallelRowLinear(4 * hidden_size, hidden_size, process_group=process_group)
         self.gelu_impl = BloomGelu()
-        self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
         self.hidden_dropout = config.hidden_dropout
 
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -400,16 +411,16 @@ class BloomMLP(nn.Module):
 
 
 class BloomBlock(nn.Module):
-    def __init__(self, config: BloomConfig):
+    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
         super().__init__()
         hidden_size = config.hidden_size
 
         self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.num_heads = config.n_head
-        self.self_attention = BloomAttention(config)
+        self.self_attention = BloomAttention(config, process_group=process_group)
         self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = BloomMLP(config)
+        self.mlp = BloomMLP(config, process_group=process_group)
 
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.hidden_dropout = config.hidden_dropout
@@ -581,18 +592,23 @@ BLOOM_INPUTS_DOCSTRING = r"""
     BLOOM_START_DOCSTRING,
 )
 class BloomModel(BloomPreTrainedModel):
-    def __init__(self, config: BloomConfig):
+    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.n_head
 
         # Embedding + LN Embedding
-        self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
+        if process_group is None:
+            self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
+        else:
+            self.word_embeddings = TensorParallelEmbedding(config.vocab_size, self.embed_dim, process_group=process_group)
+            self.tp_rank = process_group.rank()
+            self.tp_world_size = process_group.size()
         self.word_embeddings_layernorm = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Transformer blocks
-        self.h = nn.ModuleList([BloomBlock(config) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([BloomBlock(config, process_group=process_group) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -705,7 +721,16 @@ class BloomModel(BloomPreTrainedModel):
         else:
             attention_mask = attention_mask.to(hidden_states.device)
 
-        alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
+        alibi = build_alibi_tensor(attention_mask, self.num_heads)
+
+        if hasattr(self, "tp_rank"):
+            assert self.num_heads % self.tp_world_size == 0
+            block_size = self.num_heads // self.tp_world_size
+            alibi = alibi[:, self.tp_rank * block_size: (self.tp_rank + 1) * block_size]
+            alibi = alibi.reshape(batch_size * block_size, 1, seq_length_with_past)
+        else:
+            alibi = alibi.reshape(batch_size * self.num_heads, 1, seq_length_with_past)
+        alibi = alibi.to(hidden_states.dtype)
 
         causal_mask = self._prepare_attn_mask(
             attention_mask,
@@ -787,8 +812,19 @@ class BloomForCausalLM(BloomPreTrainedModel):
 
     def __init__(self, config: BloomConfig):
         super().__init__(config)
-        self.transformer = BloomModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        print(config)
+        ### HACK
+        if config.tp_parallel:
+            process_group = torch.distributed.distributed_c10d._get_default_group()
+        else:
+            process_group = None
+        ###
+        self.transformer = BloomModel(config, process_group)
+
+        if process_group is None:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        else:
+            self.lm_head = TensorParallelColumnLinear(config.hidden_size, config.vocab_size, process_group=process_group, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
