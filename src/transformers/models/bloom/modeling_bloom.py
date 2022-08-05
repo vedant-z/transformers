@@ -127,6 +127,7 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int) -> torch.Te
     alibi = slopes[..., None] * arange_tensor
     return alibi
 
+@torch.jit.script
 
 def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: bool) -> torch.Tensor:
     """
@@ -146,7 +147,7 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
     out = residual + out
     return out
 
-
+@torch.jit.script
 def bloom_gelu_forward(x: torch.Tensor) -> torch.Tensor:
     """
     Custom bias GELU function. Adapted from Megatron-DeepSpeed code. Here we use a simple implementation (inference) to
