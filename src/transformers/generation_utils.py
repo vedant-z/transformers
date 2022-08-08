@@ -1739,14 +1739,9 @@ class GenerationMixin:
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id is not None:
                 unfinished_sequences &= next_tokens != eos_token_id
-                if torch.all(~unfinished_sequences):
-                    if not synced_gpus:
-                        break
-                    else:
-                        this_peer_finished = True
 
             # stop when each sentence is finished, or if we exceed the maximum length
-            if stopping_criteria(input_ids, scores):
+            if not (torch.any(unfinished_sequences) and not stopping_criteria(input_ids, scores)):
                 if not synced_gpus:
                     break
                 else:
