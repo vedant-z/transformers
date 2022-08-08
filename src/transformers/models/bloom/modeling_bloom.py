@@ -256,7 +256,7 @@ class BloomAttention(nn.Module):
         """
         batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
         fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
-        return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
+        return fused_qkv.split(self.head_dim, dim=-1)
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
