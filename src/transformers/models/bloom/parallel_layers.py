@@ -119,10 +119,9 @@ class TensorParallelEmbedding(nn.Embedding):
         super().__init__(block_size, embedding_dim, padding_idx=padding_idx, max_norm=max_norm, norm_type=norm_type, scale_grad_by_freq=scale_grad_by_freq, sparse=sparse, _weight=_weight, device=device, dtype=dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # TODO @thomasw21: Reduce cost of running sanity check or guarantee this via testing
-        # # Sanity check
-        # if torch.any(torch.logical_or(0 > input, input >= self.original_num_embeddings)):
-        #     raise IndexError(f"Input is required to be in [0, {self.original_num_embeddings}[, got min: {torch.min(input)} and max: {torch.max(input)}")
+        # Sanity check
+        if torch.any(torch.logical_or(0 > input, input >= self.original_num_embeddings)):
+            raise IndexError(f"Input is required to be in [0, {self.original_num_embeddings}[, got min: {torch.min(input)} and max: {torch.max(input)}")
 
         # `0` if input is in the correct interval, else `1`
         input_mask = torch.logical_or(self.min_id > input, input >= self.max_id)
