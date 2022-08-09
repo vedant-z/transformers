@@ -243,7 +243,6 @@ class BloomAttention(nn.Module):
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
     @staticmethod
-    @torch.jit.script
     def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
@@ -260,14 +259,13 @@ class BloomAttention(nn.Module):
         fused_qkv = fused_qkv.view(batch_size, seq_length, num_heads, 3 * head_dim)
         query_layer, key_layer, value_layer = fused_qkv.split(head_dim, dim=-1)
 
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, q_length, head_dim)
-        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, q_length)
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, q_length, head_dim)
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
+        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, seq_length)
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
 
         return query_layer, key_layer, value_layer
 
     @staticmethod
-    @torch.jit.script
     def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
         """
         Merge heads together over the last dimenstion
