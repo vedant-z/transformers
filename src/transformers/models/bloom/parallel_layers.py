@@ -57,7 +57,7 @@ class TensorParallelColumnLinear(nn.Module):
         # Note the the unsharded equivalent requires us to sum over bias instead of averaging.
         in_features, out_features = weight.shape
         size_out = input.size()[:-1] + (out_features,)
-        out = torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
+        return torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)
@@ -127,7 +127,7 @@ class TensorParallelRowLinear(nn.Module):
         # Note the the unsharded equivalent requires us to sum over bias instead of averaging.
         in_features, out_features = weight.shape
         size_out = input.size()[:-1] + (out_features,)
-        out = torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
+        return torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)
