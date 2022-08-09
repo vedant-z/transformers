@@ -129,7 +129,10 @@ class TensorParallelRowLinear(nn.Module):
         in_features, out_features = weight.shape
         size_out = input.size()[:-1] + (out_features,)
         # TODO @thomasw21: when using torch.jit.script, `addmm` is decomposed to `add + mm`
-        return torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
+        input = input.view(-1, in_features)
+        # with torch.jit.strict_fusion():
+        out =  torch.addmm(bias, input, weight)
+        return out.view(size_out)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)

@@ -290,23 +290,27 @@ class BloomAttention(nn.Module):
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+    @staticmethod
+    @torch.jit.script
+    def compute_attention(
+        fused_qkv: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
         alibi: torch.Tensor,
         attention_mask: torch.Tensor,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
+        head_mask: Optional[torch.Tensor],
+        beta: float,
+        inv_norm_factor: float,
+        num_heads: int,
+        use_cache: bool
     ):
-        fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
-        batch_size, q_length, _ = fused_qkv.shape
+        batch_size, q_length, three_times_hidden_size = fused_qkv.shape
+        head_dim = three_times_hidden_size // (3 * num_heads)
+        batch_size_times_num_heads = batch_size * num_heads
 
         ### TODO @thomasw21: this takes quite a bit of time, how do I accelerate that?
         # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_layer, key_layer, value_layer) = _split_heads(fused_qkv, num_heads=self.num_heads, head_dim=self.head_dim)
+        (query_layer, key_layer, value_layer) = _split_heads(fused_qkv, num_heads=num_heads,
+                                                             head_dim=head_dim)
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -329,19 +333,20 @@ class BloomAttention(nn.Module):
         matmul_result = alibi.baddbmm(
             batch1=query_layer,
             batch2=key_layer,
-            beta=self.beta,
-            alpha=self.inv_norm_factor,
+            beta=beta,
+            alpha=inv_norm_factor,
         )
 
         # change view to [batch_size, num_heads, q_length, kv_length]
-        attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
+        attention_scores = matmul_result.view(batch_size, num_heads, q_length, kv_length)
 
         # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
         input_dtype = attention_scores.dtype
         # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
         if input_dtype == torch.float16:
             attention_scores = attention_scores.to(torch.float)
-        attn_weights = attention_scores.masked_fill_(attention_mask, torch.finfo(attention_scores.dtype).min)
+        # torch.finfo not supported by torch.jit
+        attn_weights = attention_scores.masked_fill_(attention_mask, 1e-34)# torch.finfo(attention_scores.dtype).min)
         attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
 
         # # [batch_size, num_heads, q_length, kv_length]
@@ -351,13 +356,41 @@ class BloomAttention(nn.Module):
             attention_probs = attention_probs * head_mask
 
         # change view [batch_size x num_heads, q_length, kv_length]
-        attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
+        attention_probs_reshaped = attention_probs.view(batch_size_times_num_heads, q_length, kv_length)
 
         # matmul: [batch_size * num_heads, q_length, head_dim]
         context_layer = torch.bmm(attention_probs_reshaped, value_layer, out=query_layer)
 
         # change view [batch_size, num_heads, q_length, head_dim]
-        context_layer = _merge_heads(context_layer, num_heads=self.num_heads, head_dim=self.head_dim)
+        context_layer = _merge_heads(context_layer, num_heads=num_heads, head_dim=head_dim)
+
+        return context_layer, present, attention_probs
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        alibi: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ):
+        fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+        batch_size, q_length, _ = fused_qkv.shape
+
+        context_layer, present, attention_probs = self.compute_attention(
+            fused_qkv=fused_qkv,
+            layer_past=layer_past,
+            alibi=alibi,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            beta=self.beta,
+            inv_norm_factor=self.inv_norm_factor,
+            num_heads=self.num_heads,
+            use_cache=use_cache
+        )
 
         # aggregate results across tp ranks. See here: https://github.com/pytorch/pytorch/issues/76232
         if self.pretraining_tp > 1 and self.slow_but_exact:
