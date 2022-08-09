@@ -203,10 +203,7 @@ class BloomGelu(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            return GeLUFunction.apply(x)
-        else:
-            return bloom_gelu_forward(x)
+        return bloom_gelu_forward(x)
 
 
 class BloomAttention(nn.Module):
@@ -260,9 +257,9 @@ class BloomAttention(nn.Module):
         fused_qkv = fused_qkv.view(batch_size, seq_length, num_heads, 3 * head_dim)
         query_layer, key_layer, value_layer = fused_qkv.split(head_dim, dim=-1)
 
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, q_length, head_dim)
-        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, q_length)
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, q_length, head_dim)
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
+        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, seq_length)
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
 
         return query_layer, key_layer, value_layer
 
@@ -385,39 +382,47 @@ class BloomAttention(nn.Module):
 
 
 class BloomMLP(nn.Module):
-    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
+    def __init__(self, config: BloomConfig, tp_world_size:int):
         super().__init__()
         hidden_size = config.hidden_size
 
         self.pretraining_tp = config.pretraining_tp
         self.slow_but_exact = config.slow_but_exact
-        if process_group is None:
-            self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
-            self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
-        else:
-            self.dense_h_to_4h = TensorParallelColumnLinear(hidden_size, 4 * hidden_size, process_group=process_group)
-            self.dense_4h_to_h = TensorParallelRowLinear(4 * hidden_size, hidden_size, process_group=process_group)
+
+        self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size // tp_world_size)
+        self.dense_4h_to_h = nn.Linear(4 * hidden_size // tp_world_size, hidden_size)
+
+        # if process_group is None:
+        #     self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
+        #     self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
+        # else:
+        #     self.dense_h_to_4h = TensorParallelColumnLinear(hidden_size, 4 * hidden_size, process_group=process_group)
+        #     self.dense_4h_to_h = TensorParallelRowLinear(4 * hidden_size, hidden_size, process_group=process_group)
         self.gelu_impl = BloomGelu()
         self.hidden_dropout = config.hidden_dropout
 
-    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
+        return self.dense_4h_to_h(hidden_states)
 
-        if self.pretraining_tp > 1 and self.slow_but_exact:
-            intermediate_output = torch.zeros_like(residual)
-            slices = self.dense_4h_to_h.weight.shape[-1] / self.pretraining_tp
-            for i in range(self.pretraining_tp):
-                intermediate_output = intermediate_output + F.linear(
-                    hidden_states[:, :, int(i * slices) : int((i + 1) * slices)],
-                    self.dense_4h_to_h.weight[:, int(i * slices) : int((i + 1) * slices)],
-                )
-        else:
-            intermediate_output = self.dense_4h_to_h(hidden_states)
-
-        # output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
-        output = intermediate_output + residual
-
-        return output
+    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     intermediate_output = self.mlp(hidden_states)
+    #
+    #     # if self.pretraining_tp > 1 and self.slow_but_exact:
+    #     #     intermediate_output = torch.zeros_like(residual)
+    #     #     slices = self.dense_4h_to_h.weight.shape[-1] / self.pretraining_tp
+    #     #     for i in range(self.pretraining_tp):
+    #     #         intermediate_output = intermediate_output + F.linear(
+    #     #             hidden_states[:, :, int(i * slices) : int((i + 1) * slices)],
+    #     #             self.dense_4h_to_h.weight[:, int(i * slices) : int((i + 1) * slices)],
+    #     #         )
+    #     # else:
+    #     #     intermediate_output = self.dense_4h_to_h(hidden_states)
+    #
+    #     # output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
+    #     output = intermediate_output + residual
+    #
+    #     return output
 
 
 class BloomBlock(nn.Module):
@@ -430,10 +435,13 @@ class BloomBlock(nn.Module):
         self.self_attention = BloomAttention(config, process_group=process_group)
         self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = BloomMLP(config, process_group=process_group)
+        tp_world_size = process_group.size() if process_group is not None else 1
+        self.mlp = torch.jit.script(BloomMLP(config, tp_world_size=tp_world_size))
 
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.hidden_dropout = config.hidden_dropout
+
+        self.process_group = process_group
 
     def forward(
         self,
@@ -481,7 +489,10 @@ class BloomBlock(nn.Module):
             residual = attention_output
 
         # MLP.
-        output = self.mlp(layernorm_output, residual)
+        output = self.mlp(layernorm_output)
+        if self.process_group is not None:
+            torch.distributed.all_reduce(output, group=self.process_group)
+        output = output + residual
 
         if use_cache:
             outputs = (output,) + outputs
