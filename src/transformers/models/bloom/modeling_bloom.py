@@ -339,8 +339,8 @@ class BloomAttention(nn.Module):
         attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
         attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
 
-        # [batch_size, num_heads, q_length, kv_length]
-        attention_probs = self.attention_dropout(attention_probs)
+        # # [batch_size, num_heads, q_length, kv_length]
+        # attention_probs = self.attention_dropout(attention_probs)
 
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
@@ -366,7 +366,8 @@ class BloomAttention(nn.Module):
         else:
             output_tensor = self.dense(context_layer)
 
-        output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
+        # output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
+        output_tensor = output_tensor + residual
 
         outputs = (output_tensor, present)
         if output_attentions:
@@ -405,7 +406,8 @@ class BloomMLP(nn.Module):
         else:
             intermediate_output = self.dense_4h_to_h(hidden_states)
 
-        output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
+        # output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
+        output = intermediate_output + residual
 
         return output
 
