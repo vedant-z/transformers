@@ -131,7 +131,7 @@ class TensorParallelRowLinear(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)
-        torch.distributed.all_reduce(out, group=process_group)
+        torch.distributed.all_reduce(out, group=self.process_group)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
         # sharded_out = out
