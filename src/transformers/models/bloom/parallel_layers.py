@@ -60,7 +60,7 @@ class TensorParallelColumnLinear(nn.Module):
         out = torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        self.linear(input, weight=self.weight, bias=self.bias)
+        out = self.linear(input, weight=self.weight, bias=self.bias)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
         # out_from_tp_ranks = [torch.empty_like(out) for _ in range(self.process_group.size())]
@@ -130,7 +130,7 @@ class TensorParallelRowLinear(nn.Module):
         out = torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        self.linear(input, weight=self.weight, bias=self.bias)
+        out = self.linear(input, weight=self.weight, bias=self.bias)
         torch.distributed.all_reduce(out, group=process_group)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
