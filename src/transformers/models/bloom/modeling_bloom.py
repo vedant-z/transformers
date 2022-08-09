@@ -208,6 +208,54 @@ class BloomGelu(nn.Module):
         else:
             return bloom_gelu_forward(x)
 
+@torch.jit.script # this is shit for unknow reasons.
+def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
+    storage as `fused_qkv`
+
+    Args:
+        fused_qkv (`torch.tensor`, *required*): [batch_size, seq_length, num_heads * 3 * head_dim]
+
+    Returns:
+        query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
+        value: [batch_size, seq_length, num_heads, head_dim]
+    """
+    batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
+    fused_qkv = fused_qkv.view(batch_size, seq_length, num_heads, 3 * head_dim)
+    query_layer, key_layer, value_layer = fused_qkv.split(head_dim, dim=-1)
+
+    query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
+    key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, seq_length)
+    value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
+
+    return query_layer, key_layer, value_layer
+
+@torch.jit.script
+def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    """
+    Merge heads together over the last dimenstion
+
+    Args:
+        x: (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
+
+    Returns:
+        torch.tensor: [batch_size, seq_length, num_heads * head_dim]
+    """
+    # What we want to achieve is:
+    # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
+    batch_size_and_num_heads, seq_length, _ = x.shape
+    batch_size = batch_size_and_num_heads // num_heads
+
+    # First view to decompose the batch size
+    # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
+    x = x.view(batch_size, num_heads, seq_length, head_dim)
+
+    # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
+    x = x.permute(0, 2, 1, 3)
+
+    # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
+    return x.reshape(batch_size, seq_length, num_heads * head_dim)
 
 class BloomAttention(nn.Module):
     def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
@@ -242,55 +290,6 @@ class BloomAttention(nn.Module):
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
-    @staticmethod
-    def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
-        storage as `fused_qkv`
-
-        Args:
-            fused_qkv (`torch.tensor`, *required*): [batch_size, seq_length, num_heads * 3 * head_dim]
-
-        Returns:
-            query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
-            value: [batch_size, seq_length, num_heads, head_dim]
-        """
-        batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-        fused_qkv = fused_qkv.view(batch_size, seq_length, num_heads, 3 * head_dim)
-        query_layer, key_layer, value_layer = fused_qkv.split(head_dim, dim=-1)
-
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
-        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, seq_length)
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
-
-        return query_layer, key_layer, value_layer
-
-    @staticmethod
-    def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
-        """
-        Merge heads together over the last dimenstion
-
-        Args:
-            x: (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
-
-        Returns:
-            torch.tensor: [batch_size, seq_length, num_heads * head_dim]
-        """
-        # What we want to achieve is:
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
-        batch_size_and_num_heads, seq_length, _ = x.shape
-        batch_size = batch_size_and_num_heads // num_heads
-
-        # First view to decompose the batch size
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
-        x = x.view(batch_size, num_heads, seq_length, head_dim)
-
-        # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
-        x = x.permute(0, 2, 1, 3)
-
-        # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
-        return x.reshape(batch_size, seq_length, num_heads * head_dim)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -307,7 +306,7 @@ class BloomAttention(nn.Module):
 
         ### TODO @thomasw21: this takes quite a bit of time, how do I accelerate that?
         # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv, num_heads=self.num_heads, head_dim=self.head_dim)
+        (query_layer, key_layer, value_layer) = _split_heads(fused_qkv, num_heads=self.num_heads, head_dim=self.head_dim)
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -358,7 +357,7 @@ class BloomAttention(nn.Module):
         context_layer = torch.bmm(attention_probs_reshaped, value_layer, out=query_layer)
 
         # change view [batch_size, num_heads, q_length, head_dim]
-        context_layer = self._merge_heads(context_layer, num_heads=self.num_heads, head_dim=self.head_dim)
+        context_layer = _merge_heads(context_layer, num_heads=self.num_heads, head_dim=self.head_dim)
 
         # aggregate results across tp ranks. See here: https://github.com/pytorch/pytorch/issues/76232
         if self.pretraining_tp > 1 and self.slow_but_exact:
