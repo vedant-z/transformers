@@ -242,6 +242,7 @@ class BloomAttention(nn.Module):
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
+    @torch.jit.script
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
@@ -255,9 +256,15 @@ class BloomAttention(nn.Module):
             value: [batch_size, seq_length, num_heads, head_dim]
         """
         batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-        fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
-        return fused_qkv.split(self.head_dim, dim=-1)
+        fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3 * self.head_dim)
+        query_layer, key_layer, value_layer = fused_qkv.split(self.head_dim, dim=-1)
 
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, seq_length, self.head_dim)
+        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, seq_length, self.head_dim)
+        return query_layer, key_layer, value_layer
+
+    @torch.jit.script
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
         Merge heads together over the last dimenstion
@@ -295,15 +302,11 @@ class BloomAttention(nn.Module):
         output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+        batch_size, q_length, _, _ = fused_qkv.shape
 
         # 3 x [batch_size, seq_length, num_heads, head_dim]
         (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
 
-        batch_size, q_length, _, _ = query_layer.shape
-
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
-        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
@@ -391,6 +394,7 @@ class BloomMLP(nn.Module):
         self.gelu_impl = BloomGelu()
         self.hidden_dropout = config.hidden_dropout
 
+    @torch.jit.script
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
 
