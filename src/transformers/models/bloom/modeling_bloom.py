@@ -304,7 +304,7 @@ class BloomAttention(nn.Module):
         output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
-        batch_size, q_length, _, _ = fused_qkv.shape
+        batch_size, q_length, _ = fused_qkv.shape
 
         # 3 x [batch_size, seq_length, num_heads, head_dim]
         (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv, num_heads=self.num_heads, head_dim=self.head_dim)
