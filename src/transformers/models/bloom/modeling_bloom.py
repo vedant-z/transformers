@@ -267,7 +267,7 @@ class BloomAttention(nn.Module):
 
     @staticmethod
     @torch.jit.script
-    def _merge_heads(self, x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
         """
         Merge heads together over the last dimenstion
 
