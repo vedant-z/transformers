@@ -291,7 +291,6 @@ class BloomAttention(nn.Module):
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
     @staticmethod
-    @torch.jit.script
     def compute_attention(
         fused_qkv: torch.Tensor,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],

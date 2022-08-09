@@ -62,7 +62,6 @@ class TensorParallelColumnLinear(nn.Module):
 
         return F.linear(input, weight=weight.transpose(1,0), bias=bias)
 
-
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)
 
@@ -83,7 +82,6 @@ class TensorParallelColumnLinear(nn.Module):
         # ###
 
         return out
-
 
 class TensorParallelRowLinear(nn.Module):
     def __init__(
