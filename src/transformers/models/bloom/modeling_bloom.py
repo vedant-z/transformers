@@ -242,9 +242,7 @@ class BloomAttention(nn.Module):
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
-    @staticmethod
-    @torch.jit.script
-    def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
         storage as `fused_qkv`
@@ -257,17 +255,10 @@ class BloomAttention(nn.Module):
             value: [batch_size, seq_length, num_heads, head_dim]
         """
         batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-        fused_qkv = fused_qkv.view(batch_size, seq_length, num_heads, 3 * head_dim)
-        query_layer, key_layer, value_layer = fused_qkv.split(head_dim, dim=-1)
+        fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
+        return fused_qkv.split(self.head_dim, dim=-1)
 
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
-        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * num_heads, head_dim, seq_length)
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
-        return query_layer, key_layer, value_layer
-
-    @staticmethod
-    @torch.jit.script
-    def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
         Merge heads together over the last dimenstion
 
@@ -280,17 +271,17 @@ class BloomAttention(nn.Module):
         # What we want to achieve is:
         # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
         batch_size_and_num_heads, seq_length, _ = x.shape
-        batch_size = batch_size_and_num_heads // num_heads
+        batch_size = batch_size_and_num_heads // self.num_heads
 
         # First view to decompose the batch size
         # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
-        x = x.view(batch_size, num_heads, seq_length, head_dim)
+        x = x.view(batch_size, self.num_heads, seq_length, self.head_dim)
 
         # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
         x = x.permute(0, 2, 1, 3)
 
         # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
-        return x.reshape(batch_size, seq_length, num_heads * head_dim)
+        return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
 
     def forward(
         self,
@@ -304,11 +295,15 @@ class BloomAttention(nn.Module):
         output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
-        batch_size, q_length, _ = fused_qkv.shape
 
         # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv, num_heads=self.num_heads, head_dim=self.head_dim)
+        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
 
+        batch_size, q_length, _, _ = query_layer.shape
+
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
@@ -357,7 +352,7 @@ class BloomAttention(nn.Module):
         context_layer = torch.bmm(attention_probs_reshaped, value_layer)
 
         # change view [batch_size, num_heads, q_length, head_dim]
-        context_layer = self._merge_heads(context_layer, num_heads=self.num_heads, head_dim=self.head_dim)
+        context_layer = self._merge_heads(context_layer)
 
         # aggregate results across tp ranks. See here: https://github.com/pytorch/pytorch/issues/76232
         if self.pretraining_tp > 1 and self.slow_but_exact:
@@ -378,6 +373,7 @@ class BloomAttention(nn.Module):
             outputs += (attention_probs,)
 
         return outputs
+
 
 class BloomMLP(nn.Module):
     def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
