@@ -51,8 +51,16 @@ class TensorParallelColumnLinear(nn.Module):
             self.in_features, self.out_features, self.bias is not None
         )
 
+    @staticmethod
+    @torch.jit.script
+    def linear(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+        # Note the the unsharded equivalent requires us to sum over bias instead of averaging.
+        in_features, out_features = weight.shape
+        size_out = input.size()[:-1] + (out_features,)
+        out = torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        out = torch.addmm(self.bias, input.view(-1, self.in_features), self.weight).view(*(input.shape[:-1]), self.out_features)
+        self.linear(input, weight=self.weight, bias=self.bias)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
         # out_from_tp_ranks = [torch.empty_like(out) for _ in range(self.process_group.size())]
@@ -113,10 +121,17 @@ class TensorParallelRowLinear(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    @torch.jit.script
+    def linear(input: torch.Tensor, weight: torch.Tensor, bias:torch.Tensor):
         # Note the the unsharded equivalent requires us to sum over bias instead of averaging.
-        out = torch.addmm(self.bias, input.view(-1, self.in_features), self.weight).view(*(input.shape[:-1]), self.out_features)
-        torch.distributed.all_reduce(out, group=self.process_group)
+        in_features, out_features = weight.shape
+        size_out = input.size()[:-1] + (out_features,)
+        out = torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        self.linear(input, weight=self.weight, bias=self.bias)
+        torch.distributed.all_reduce(out, group=process_group)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
         # sharded_out = out
