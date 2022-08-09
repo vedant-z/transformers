@@ -831,7 +831,9 @@ class BloomForCausalLM(BloomPreTrainedModel):
         if process_group is None:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         else:
-            self.lm_head = TensorParallelColumnLinear(config.hidden_size, config.vocab_size, process_group=process_group, bias=False)
+            # TODO @thomasw21: TensorParallelColumnLinear doesn't inherit nn.Linear anymore as we switch the underlying storage
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size // process_group.size(), bias=False)
+            # self.lm_head = TensorParallelColumnLinear(config.hidden_size, config.vocab_size, process_group=process_group, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()

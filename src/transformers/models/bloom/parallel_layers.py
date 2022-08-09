@@ -2,9 +2,10 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 from torch import nn
+import math
 
 
-class TensorParallelColumnLinear(nn.Linear):
+class TensorParallelColumnLinear(nn.Module):
     def __init__(
         self,
         in_features,
@@ -14,16 +15,44 @@ class TensorParallelColumnLinear(nn.Linear):
         device=None,
         dtype=None,
     ):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+
         self.process_group = process_group
         self.tp_world_size = process_group.size()
 
         assert out_features % self.tp_world_size == 0
-        self.block_size = out_features // self.tp_world_size
 
-        super().__init__(in_features, self.block_size, bias=bias, device=device, dtype=dtype)
+        self.in_features = in_features
+        self.out_features = out_features // self.tp_world_size
+        # We change from traditional `nn.Linear` and remove unecessary `torch.Tensor.transpose` operation
+        self.weight = nn.Parameter(torch.empty((self.in_features, self.out_features), **factory_kwargs))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """From `torch.nn.Linear`"""
+        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
+        # https://github.com/pytorch/pytorch/issues/57109
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def extra_repr(self) -> str:
+        """From `torch.nn.Linear`"""
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        out = super().forward(input)
+        out = torch.addmm(self.bias, input.view(-1, self.in_features), self.weight).view(*(input.shape[:-1]), self.out_features)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
         # out_from_tp_ranks = [torch.empty_like(out) for _ in range(self.process_group.size())]
@@ -44,7 +73,7 @@ class TensorParallelColumnLinear(nn.Linear):
         return out
 
 
-class TensorParallelRowLinear(nn.Linear):
+class TensorParallelRowLinear(nn.Module):
     def __init__(
         self,
         in_features,
@@ -54,17 +83,39 @@ class TensorParallelRowLinear(nn.Linear):
         device=None,
         dtype=None,
     ):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+
         self.process_group = process_group
         self.tp_world_size = process_group.size()
 
         assert in_features % self.tp_world_size == 0
-        self.block_size = in_features // self.tp_world_size
 
-        super().__init__(self.block_size, out_features, bias=bias, device=device, dtype=dtype)
+        self.in_features = in_features // self.tp_world_size
+        self.out_features = out_features
+        # We change from traditional `nn.Linear` and remove unecessary `torch.Tensor.transpose` operation
+        self.weight = nn.Parameter(torch.empty((self.in_features, self.out_features), **factory_kwargs))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """From `torch.nn.Linear`"""
+        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
+        # https://github.com/pytorch/pytorch/issues/57109
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # Note the the unsharded equivalent requires us to sum over bias instead of averaging.
-        out = super().forward(input)
+        out = torch.addmm(self.bias, input.view(-1, self.in_features), self.weight).view(*(input.shape[:-1]), self.out_features)
         torch.distributed.all_reduce(out, group=self.process_group)
 
         # ### DEBUG @thomasw21:: Check that shard model output the same as the non sharded version
@@ -87,6 +138,12 @@ class TensorParallelRowLinear(nn.Linear):
         # ###
 
         return out
+
+    def extra_repr(self) -> str:
+        """From `torch.nn.Linear`"""
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
 
 class TensorParallelEmbedding(nn.Embedding):
     def __init__(
