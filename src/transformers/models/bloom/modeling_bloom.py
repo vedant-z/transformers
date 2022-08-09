@@ -354,7 +354,7 @@ class BloomAttention(nn.Module):
         attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
 
         # matmul: [batch_size * num_heads, q_length, head_dim]
-        context_layer = torch.bmm(attention_probs_reshaped, value_layer)
+        context_layer = torch.bmm(attention_probs_reshaped, value_layer, out=query_layer)
 
         # change view [batch_size, num_heads, q_length, head_dim]
         context_layer = self._merge_heads(context_layer, num_heads=self.num_heads, head_dim=self.head_dim)
@@ -372,7 +372,7 @@ class BloomAttention(nn.Module):
             output_tensor = self.dense(context_layer)
 
         # output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
-        output_tensor = output_tensor + residual
+        output_tensor += residual
 
         outputs = (output_tensor, present)
         if output_attentions:
@@ -492,7 +492,7 @@ class BloomBlock(nn.Module):
         output = self.mlp(layernorm_output)
         if self.process_group is not None:
             torch.distributed.all_reduce(output, group=self.process_group)
-        output = output + residual
+        output += residual
 
         if use_cache:
             outputs = (output,) + outputs
