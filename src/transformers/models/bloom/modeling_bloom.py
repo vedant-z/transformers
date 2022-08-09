@@ -208,7 +208,7 @@ class BloomGelu(nn.Module):
         else:
             return bloom_gelu_forward(x)
 
-@torch.jit.script # this is shit for unknow reasons.
+@torch.jit.script # this is shit for unknow reasons, it removing makes it go faster
 def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
@@ -281,8 +281,8 @@ class BloomAttention(nn.Module):
         self.beta = 1.0
 
         if process_group is None:
-            self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
-            self.dense = nn.Linear(self.hidden_size, self.hidden_size)
+            self.query_key_value = torch.run_frozen_optimizations(torch.jit.script(nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)), optimize_numerics=False)
+            self.dense = torch.run_frozen_optimizations(torch.jit.script(nn.Linear(self.hidden_size, self.hidden_size)), optimize_numerics=False)
         else:
             assert self.num_heads % process_group.size() == 0
             self.num_heads = self.num_heads // process_group.size()
@@ -389,8 +389,8 @@ class BloomMLP(nn.Module):
         self.pretraining_tp = config.pretraining_tp
         self.slow_but_exact = config.slow_but_exact
         if process_group is None:
-            self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
-            self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
+            self.dense_h_to_4h = torch.run_frozen_optimizations(torch.jit.script(nn.Linear(hidden_size, 4 * hidden_size)), optimize_numerics=False)
+            self.dense_4h_to_h = torch.run_frozen_optimizations(torch.jit.script(nn.Linear(4 * hidden_size, hidden_size)), optimize_numerics=False)
         else:
             self.dense_h_to_4h = TensorParallelColumnLinear(hidden_size, 4 * hidden_size, process_group=process_group)
             self.dense_4h_to_h = TensorParallelRowLinear(4 * hidden_size, hidden_size, process_group=process_group)
@@ -829,6 +829,7 @@ class BloomForCausalLM(BloomPreTrainedModel):
         self.transformer = BloomModel(config, process_group)
 
         if process_group is None:
+            # TODO @thomasw21 optimize to transpose
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         else:
             self.lm_head = TensorParallelColumnLinear(config.hidden_size, config.vocab_size, process_group=process_group, bias=False)
