@@ -60,7 +60,16 @@ class TensorParallelColumnLinear(nn.Module):
         # # TODO @thomasw21: when using torch.jit.script, `addmm` is decomposed to `add + mm`
         # return torch.addmm(bias, input.view(-1, in_features), weight).view(size_out)
 
-        return F.linear(input, weight=weight.transpose(1,0), bias=bias)
+        in_features, out_features = weight.shape
+        size_out = input.size()[:-1] + (out_features,)
+        # TODO @thomasw21: when using torch.jit.script, `addmm` is decomposed to `add + mm`
+        input = input.view(-1, in_features)
+        out = torch.empty(size_out, device=input.device, dtype=input.dtype)
+        out = torch.addmm(bias, input, weight, out=out.view(-1, out_features))
+
+        return out
+
+        # return F.linear(input, weight=weight.transpose(1,0), bias=bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)
@@ -135,7 +144,16 @@ class TensorParallelRowLinear(nn.Module):
         # out =  torch.addmm(bias, input, weight)
         # return out.view(size_out)
 
-        return F.linear(input, weight=weight.transpose(1,0), bias=bias)
+        in_features, out_features = weight.shape
+        size_out = input.size()[:-1] + (out_features,)
+        # TODO @thomasw21: when using torch.jit.script, `addmm` is decomposed to `add + mm`
+        input = input.view(-1, in_features)
+        out = torch.empty(size_out, device=input.device, dtype=input.dtype)
+        out = torch.addmm(bias, input, weight, out=out.view(-1, out_features))
+
+        return out
+
+        # return F.linear(input, weight=weight.transpose(1,0), bias=bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.linear(input, weight=self.weight, bias=self.bias)
