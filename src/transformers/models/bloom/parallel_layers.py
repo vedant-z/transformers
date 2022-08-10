@@ -64,7 +64,8 @@ class TensorParallelColumnLinear(nn.Module):
         size_out = input.size()[:-1] + (out_features,)
         # TODO @thomasw21: when using torch.jit.script, `addmm` is decomposed to `add + mm`
         input = input.view(-1, in_features)
-        out = torch.empty(size_out, device=input.device, dtype=input.dtype)
+        # HACK @thomas21: turns out `aten::addmm.out` is not decomposed
+        out = torch.empty((0,), device=input.device, dtype=input.dtype)
         out = torch.addmm(bias, input, weight, out=out.view(-1, out_features))
 
         return out.view(size_out)
@@ -148,7 +149,8 @@ class TensorParallelRowLinear(nn.Module):
         size_out = input.size()[:-1] + (out_features,)
         # TODO @thomasw21: when using torch.jit.script, `addmm` is decomposed to `add + mm`
         input = input.view(-1, in_features)
-        out = torch.empty(size_out, device=input.device, dtype=input.dtype)
+        # HACK @thomas21: turns out `aten::addmm.out` is not decomposed
+        out = torch.empty((0,), device=input.device, dtype=input.dtype)
         out = torch.addmm(bias, input, weight, out=out.view(-1, out_features))
 
         return out.view(size_out)
