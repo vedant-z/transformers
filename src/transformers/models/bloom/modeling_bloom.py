@@ -329,15 +329,12 @@ class BloomAttention(nn.Module):
 
         # [batch_size * num_heads, q_length, kv_length]
         # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
-        matmul_result = alibi.baddbmm(
+        attention_scores = alibi.baddbmm(
             batch1=query_layer,
             batch2=key_layer,
             beta=beta,
             alpha=inv_norm_factor,
         )
-
-        # change view to [batch_size, num_heads, q_length, kv_length]
-        attention_scores = matmul_result.view(batch_size, num_heads, q_length, kv_length)
 
         # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
         input_dtype = attention_scores.dtype
@@ -345,7 +342,7 @@ class BloomAttention(nn.Module):
         if input_dtype == torch.float16:
             attention_scores = attention_scores.to(torch.float)
         # torch.finfo not supported by torch.jit, we temporarily remplace with `-1e34`
-        attn_weights = attention_scores.masked_fill_(attention_mask, -1e34)# torch.finfo(attention_scores.dtype).min)
+        attn_weights = attention_scores.masked_fill_(attention_mask, torch.finfo(attention_scores.dtype).min)
         attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
 
         # # [batch_size, num_heads, q_length, kv_length]
@@ -354,11 +351,8 @@ class BloomAttention(nn.Module):
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
 
-        # change view [batch_size x num_heads, q_length, kv_length]
-        attention_probs_reshaped = attention_probs.view(batch_size_times_num_heads, q_length, kv_length)
-
         # matmul: [batch_size * num_heads, q_length, head_dim]
-        context_layer = torch.bmm(attention_probs_reshaped, value_layer, out=query_layer)
+        context_layer = torch.bmm(attention_probs, value_layer, out=query_layer)
 
         # change view [batch_size, num_heads, q_length, head_dim]
         context_layer = _merge_heads(context_layer, num_heads=num_heads, head_dim=head_dim)
@@ -762,20 +756,23 @@ class BloomModel(BloomPreTrainedModel):
 
         alibi = build_alibi_tensor(attention_mask, self.num_heads)
 
-        if hasattr(self, "tp_rank"):
-            assert self.num_heads % self.tp_world_size == 0
-            block_size = self.num_heads // self.tp_world_size
-            alibi = alibi[:, self.tp_rank * block_size: (self.tp_rank + 1) * block_size]
-            alibi = alibi.reshape(batch_size * block_size, 1, seq_length_with_past)
-        else:
-            alibi = alibi.reshape(batch_size * self.num_heads, 1, seq_length_with_past)
-        alibi = alibi.to(hidden_states.dtype)
-
         causal_mask = self._prepare_attn_mask(
             attention_mask,
             input_shape=(batch_size, seq_length),
             past_key_values_length=past_key_values_length,
         )
+
+        if hasattr(self, "tp_rank"):
+            assert self.num_heads % self.tp_world_size == 0
+            block_size = self.num_heads // self.tp_world_size
+            alibi = alibi[:, self.tp_rank * block_size: (self.tp_rank + 1) * block_size]
+            alibi = alibi.reshape(batch_size * block_size, 1, seq_length_with_past)
+            causal_mask = causal_mask[:, 0,:,:].repeat(block_size, 1, 1)
+        else:
+            alibi = alibi.reshape(batch_size * self.num_heads, 1, seq_length_with_past)
+            causal_mask = causal_mask[:, 0,:,:].repeat(self.num_heads, 1, 1)
+
+        alibi = alibi.to(hidden_states.dtype)
 
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
 
