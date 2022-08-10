@@ -67,7 +67,7 @@ class TensorParallelColumnLinear(nn.Module):
         out = torch.empty(size_out, device=input.device, dtype=input.dtype)
         out = torch.addmm(bias, input, weight, out=out.view(-1, out_features))
 
-        return out
+        return out.view(size_out)
 
         # return F.linear(input, weight=weight.transpose(1,0), bias=bias)
 
@@ -151,7 +151,7 @@ class TensorParallelRowLinear(nn.Module):
         out = torch.empty(size_out, device=input.device, dtype=input.dtype)
         out = torch.addmm(bias, input, weight, out=out.view(-1, out_features))
 
-        return out
+        return out.view(size_out)
 
         # return F.linear(input, weight=weight.transpose(1,0), bias=bias)
 
