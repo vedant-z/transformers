@@ -396,7 +396,7 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
         # >=760m + allow_fp16_reduced_precision_reduction = True  + torch.bmm  ==> PASS
         # >=760m + allow_fp16_reduced_precision_reduction = False  + torch.bmm  ==> PASS
 
-        path_350m = "bigscience/bloom-350m"
+        path_350m = "bigscience/bloom-560m"
         model = BloomForCausalLM.from_pretrained(path_350m, use_cache=True, revision="gs555750").cuda()
         model = model.eval()
         tokenizer = BloomTokenizerFast.from_pretrained(path_350m)
