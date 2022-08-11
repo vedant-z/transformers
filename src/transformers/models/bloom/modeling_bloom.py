@@ -69,7 +69,7 @@ def _make_causal_mask(
     if past_key_values_length > 0:
         mask[:, :past_key_values_length] = False
 
-    expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
+    expanded_mask = mask[None, :, :].expand(batch_size, target_length, target_length + past_key_values_length)
     return expanded_mask
 
 
@@ -80,8 +80,8 @@ def _expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
     batch_size, src_length = mask.shape
     tgt_length = tgt_length if tgt_length is not None else src_length
 
-    expanded_mask = ~(mask[:, None, None, :].to(torch.bool))
-    return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
+    expanded_mask = ~(mask[:, None, :].to(torch.bool))
+    return expanded_mask.expand(batch_size, tgt_length, src_length)
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -658,7 +658,7 @@ class BloomModel(BloomPreTrainedModel):
         self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
     ) -> torch.BoolTensor:
         # create causal mask
-        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        # [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
         combined_attention_mask = None
         device = attention_mask.device
         _, src_length = input_shape
@@ -668,7 +668,7 @@ class BloomModel(BloomPreTrainedModel):
                 input_shape, device=device, past_key_values_length=past_key_values_length
             )
 
-        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        # [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
         expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
         combined_attention_mask = (
             expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
@@ -767,10 +767,10 @@ class BloomModel(BloomPreTrainedModel):
             block_size = self.num_heads // self.tp_world_size
             alibi = alibi[:, self.tp_rank * block_size: (self.tp_rank + 1) * block_size]
             alibi = alibi.reshape(batch_size * block_size, 1, seq_length_with_past)
-            causal_mask = causal_mask[:, 0,:,:].repeat(block_size, 1, 1)
+            causal_mask = torch.repeat_interleave(causal_mask, block_size, dim=0)
         else:
             alibi = alibi.reshape(batch_size * self.num_heads, 1, seq_length_with_past)
-            causal_mask = causal_mask[:, 0,:,:].repeat(self.num_heads, 1, 1)
+            causal_mask = torch.repeat_interleave(causal_mask, self.num_heads, dim=0)
 
         alibi = alibi.to(hidden_states.dtype)
 
